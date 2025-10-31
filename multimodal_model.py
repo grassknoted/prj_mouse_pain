@@ -1,11 +1,12 @@
 """
 Multimodal model for action recognition combining visual and pose features.
-Architecture: Visual stream (3D CNN) + Pose stream (MLP) -> Fusion -> Classification
+Architecture: Visual stream (DinoV2 + Bi-GRU + Attention) + Pose stream (MLP + Attention) -> Fusion -> Classification
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as transforms
 
 
 class Conv3DBlock(nn.Module):
@@ -111,6 +112,165 @@ class PoseStream(nn.Module):
         return x
 
 
+class DinoV2VisualStream(nn.Module):
+    """
+    Visual feature processing stream using frozen DinoV2 + Bi-GRU + Temporal Attention.
+
+    Architecture:
+    1. Frozen DinoV2-large encoder (per-frame feature extraction)
+    2. Bi-directional GRU for temporal modeling
+    3. Temporal attention for frame-wise importance weighting
+    4. FC projection to output dimension
+    """
+
+    def __init__(self, output_dim: int = 256, freeze_dinov2: bool = True):
+        super(DinoV2VisualStream, self).__init__()
+
+        self.output_dim = output_dim
+        self.freeze_dinov2 = freeze_dinov2
+        self.dinov2 = None  # Lazy loading
+        self.dinov2_dim = 1024  # DinoV2-large output dimension
+
+        # Preprocessing for DinoV2 (expects 224x224 RGB images, normalized)
+        self.resize = transforms.Resize((224, 224), antialias=True)
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+
+        # Bi-directional GRU for temporal modeling
+        self.gru_hidden_dim = 512
+        self.bi_gru = nn.GRU(
+            input_size=self.dinov2_dim,
+            hidden_size=self.gru_hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.3
+        )
+
+        # Temporal attention mechanism
+        # Attention over GRU outputs
+        self.temporal_attention = nn.Sequential(
+            nn.Linear(self.gru_hidden_dim * 2, 256),  # *2 for bidirectional
+            nn.Tanh(),
+            nn.Linear(256, 1)
+        )
+
+        # Final projection to output dimension
+        self.fc_out = nn.Linear(self.gru_hidden_dim * 2, output_dim)
+        self.dropout = nn.Dropout(0.3)
+
+    def _load_dinov2(self):
+        """Lazy load DinoV2 model to avoid multi-process conflicts."""
+        if self.dinov2 is None:
+            import os
+            print("Loading DinoV2-large model (this may take a moment)...")
+            # Force use of local cache and avoid download conflicts
+            os.environ['TORCH_HOME'] = os.path.expanduser('~/.cache/torch')
+            self.dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', verbose=False, trust_repo=True)
+
+            # Freeze DinoV2 parameters
+            if self.freeze_dinov2:
+                for param in self.dinov2.parameters():
+                    param.requires_grad = False
+                self.dinov2.eval()
+
+            print("DinoV2 loaded successfully!")
+
+    def preprocess_frames(self, frames):
+        """
+        Memory-efficient preprocessing of grayscale frames for DinoV2.
+
+        Args:
+            frames: (B, T, H, W) grayscale frames in [0, 1]
+
+        Returns:
+            (B, T, 3, 224, 224) preprocessed RGB frames
+        """
+        B, T, H, W = frames.shape
+
+        # Process in a more memory-efficient way
+        # Convert grayscale to RGB by repeating channels
+        frames_rgb = frames.unsqueeze(2).expand(-1, -1, 3, -1, -1)  # (B, T, 3, H, W) - uses expand instead of repeat
+
+        # Resize and normalize all at once
+        frames_flat = frames_rgb.reshape(B * T, 3, H, W)  # (B*T, 3, H, W)
+        frames_resized = self.resize(frames_flat)  # (B*T, 3, 224, 224)
+        frames_normalized = self.normalize(frames_resized)  # (B*T, 3, 224, 224)
+
+        # Reshape back
+        frames_processed = frames_normalized.reshape(B, T, 3, 224, 224)
+        return frames_processed
+
+    def extract_dinov2_features(self, frames):
+        """
+        Extract DinoV2 features for each frame (memory-safe).
+
+        Args:
+            frames: (B, T, 3, 224, 224) preprocessed frames
+
+        Returns:
+            (B, T, 1024) DinoV2 features
+        """
+        B, T, C, H, W = frames.shape
+
+        # Reshape to process all frames in batch
+        frames_flat = frames.reshape(B * T, C, H, W)  # (B*T, 3, 224, 224)
+
+        # Extract features with frozen DinoV2 (always no_grad for frozen model)
+        self.dinov2.eval()  # Ensure eval mode
+        with torch.no_grad():
+            # Process frames and immediately move to same device as model
+            features = self.dinov2(frames_flat)  # (B*T, 1024)
+
+        # Reshape back to (B, T, 1024)
+        features = features.reshape(B, T, self.dinov2_dim)
+
+        return features
+
+    def forward(self, x):
+        """
+        Forward pass.
+
+        Args:
+            x: (B, T, H, W) or (B, 1, T, H, W) grayscale frames in [0, 1]
+
+        Returns:
+            (B, output_dim) aggregated visual representation
+        """
+        # Lazy load DinoV2 on first forward pass
+        self._load_dinov2()
+
+        # Remove channel dimension if present
+        if x.dim() == 5:
+            x = x.squeeze(1)  # (B, T, H, W)
+
+        B, T, H, W = x.shape
+
+        # Preprocess frames for DinoV2
+        frames_processed = self.preprocess_frames(x)  # (B, T, 3, 224, 224)
+
+        # Extract DinoV2 features per frame
+        dinov2_features = self.extract_dinov2_features(frames_processed)  # (B, T, 1024)
+
+        # Apply Bi-GRU for temporal modeling
+        gru_out, _ = self.bi_gru(dinov2_features)  # (B, T, 1024) where 1024 = gru_hidden_dim * 2
+
+        # Temporal attention
+        attention_scores = self.temporal_attention(gru_out)  # (B, T, 1)
+        attention_weights = F.softmax(attention_scores, dim=1)  # (B, T, 1)
+
+        # Weighted sum of GRU outputs
+        attended_features = torch.sum(gru_out * attention_weights, dim=1)  # (B, 1024)
+
+        # Final projection
+        output = self.fc_out(attended_features)  # (B, output_dim)
+        output = self.dropout(output)
+
+        return output
+
+
 class VisualStream(nn.Module):
     """
     Visual feature processing stream using 3D CNN.
@@ -169,16 +329,16 @@ class VisualStream(nn.Module):
 
 class MultimodalFusionModel(nn.Module):
     """
-    Multimodal model combining visual and pose features.
+    Multimodal model combining visual and pose features with DinoV2.
 
     Architecture:
-    - Visual stream: 3D CNN processing video frames
+    - Visual stream: DinoV2 (frozen) + Bi-GRU + Temporal Attention
     - Pose stream: MLP with temporal attention on pose features
     - Fusion: Concatenation + MLP
     - Classification head: FC layers
 
     Input:
-    - Visual: (B, 1, T, H, W) grayscale video clips
+    - Visual: (B, 1, T, H, W) or (B, T, H, W) grayscale video clips
     - Pose: (B, T, 18) pose features (8 lengths + 10 angles)
 
     Output:
@@ -191,12 +351,16 @@ class MultimodalFusionModel(nn.Module):
         visual_dim: int = 256,
         pose_dim: int = 256,
         fusion_dim: int = 512,
-        dropout: float = 0.5
+        dropout: float = 0.5,
+        use_dinov2: bool = True
     ):
         super(MultimodalFusionModel, self).__init__()
 
         # Streams
-        self.visual_stream = VisualStream(output_dim=visual_dim)
+        if use_dinov2:
+            self.visual_stream = DinoV2VisualStream(output_dim=visual_dim)
+        else:
+            self.visual_stream = VisualStream(output_dim=visual_dim)
         self.pose_stream = PoseStream(input_dim=18, output_dim=pose_dim)
 
         # Fusion
@@ -251,30 +415,52 @@ class MultimodalFusionModel(nn.Module):
 
 class MultimodalFusionModelLight(nn.Module):
     """
-    Lightweight multimodal model (memory-efficient variant).
+    Lightweight multimodal model (memory-efficient variant) with DinoV2 support.
     """
 
-    def __init__(self, num_classes: int = 7, dropout: float = 0.4):
+    def __init__(self, num_classes: int = 7, dropout: float = 0.4, use_dinov2: bool = True):
         super(MultimodalFusionModelLight, self).__init__()
 
-        # Visual stream (lightweight)
-        self.visual_layer1 = nn.Sequential(
-            Conv3DBlock(1, 32, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1)),
-            nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        )
+        self.use_dinov2 = use_dinov2
 
-        self.visual_layer2 = nn.Sequential(
-            Conv3DBlock(32, 64, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1)),
-            nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
-        )
+        if use_dinov2:
+            # Use DinoV2 visual stream (lighter version with smaller GRU)
+            self.dinov2 = None  # Lazy loading
+            self.dinov2_loaded = False
 
-        self.visual_layer3 = nn.Sequential(
-            Conv3DBlock(64, 128, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1)),
-            nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
-        )
+            self.resize = transforms.Resize((224, 224), antialias=True)
+            self.normalize = transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
 
-        self.visual_avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
-        self.visual_fc = nn.Linear(128, 128)
+            # Lightweight GRU for temporal modeling
+            self.gru = nn.GRU(1024, 256, num_layers=1, batch_first=True, bidirectional=True, dropout=dropout)
+            self.temporal_attention = nn.Sequential(
+                nn.Linear(512, 128),
+                nn.Tanh(),
+                nn.Linear(128, 1)
+            )
+            self.visual_fc = nn.Linear(512, 128)
+        else:
+            # Visual stream (lightweight 3D CNN)
+            self.visual_layer1 = nn.Sequential(
+                Conv3DBlock(1, 32, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1)),
+                nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
+            )
+
+            self.visual_layer2 = nn.Sequential(
+                Conv3DBlock(32, 64, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1)),
+                nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
+            )
+
+            self.visual_layer3 = nn.Sequential(
+                Conv3DBlock(64, 128, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1)),
+                nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
+            )
+
+            self.visual_avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
+            self.visual_fc = nn.Linear(128, 128)
 
         # Pose stream (lightweight)
         self.pose_fc1 = nn.Linear(18, 64)
@@ -296,6 +482,19 @@ class MultimodalFusionModelLight(nn.Module):
         # Classification
         self.classifier = nn.Linear(256, num_classes)
 
+    def _load_dinov2_light(self):
+        """Lazy load DinoV2 for light model."""
+        if self.use_dinov2 and not self.dinov2_loaded:
+            import os
+            print("Loading DinoV2-large for light model...")
+            os.environ['TORCH_HOME'] = os.path.expanduser('~/.cache/torch')
+            self.dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', verbose=False, trust_repo=True)
+            for param in self.dinov2.parameters():
+                param.requires_grad = False
+            self.dinov2.eval()
+            self.dinov2_loaded = True
+            print("DinoV2 loaded for light model!")
+
     def forward(self, visual, pose):
         """
         Args:
@@ -305,17 +504,44 @@ class MultimodalFusionModelLight(nn.Module):
         Returns:
             logits: (B, num_classes)
         """
-        # Add channel if needed
-        if visual.dim() == 4:
-            visual = visual.unsqueeze(1)
-
         # Visual stream
-        visual = self.visual_layer1(visual)
-        visual = self.visual_layer2(visual)
-        visual = self.visual_layer3(visual)
-        visual = self.visual_avgpool(visual)
-        visual = visual.view(visual.size(0), -1)
-        visual = F.relu(self.visual_fc(visual))  # (B, 128)
+        if self.use_dinov2:
+            # Lazy load DinoV2
+            self._load_dinov2_light()
+            # Remove channel dimension if present
+            if visual.dim() == 5:
+                visual = visual.squeeze(1)  # (B, T, H, W)
+
+            B, T, H, W = visual.shape
+
+            # Preprocess for DinoV2 (memory-efficient)
+            visual_rgb = visual.unsqueeze(2).expand(-1, -1, 3, -1, -1)  # (B, T, 3, H, W) - expand instead of repeat
+            frames_flat = visual_rgb.reshape(B * T, 3, H, W)
+            frames_resized = self.resize(frames_flat)
+            frames_processed = self.normalize(frames_resized)  # (B*T, 3, 224, 224)
+
+            # Extract DinoV2 features
+            with torch.no_grad():
+                dinov2_feat = self.dinov2(frames_processed)  # (B*T, 1024)
+            dinov2_feat = dinov2_feat.reshape(B, T, 1024)
+
+            # Apply GRU and attention
+            gru_out, _ = self.gru(dinov2_feat)  # (B, T, 512)
+            attn_scores = self.temporal_attention(gru_out)  # (B, T, 1)
+            attn_weights = F.softmax(attn_scores, dim=1)
+            visual = torch.sum(gru_out * attn_weights, dim=1)  # (B, 512)
+            visual = F.relu(self.visual_fc(visual))  # (B, 128)
+        else:
+            # 3D CNN path
+            if visual.dim() == 4:
+                visual = visual.unsqueeze(1)
+
+            visual = self.visual_layer1(visual)
+            visual = self.visual_layer2(visual)
+            visual = self.visual_layer3(visual)
+            visual = self.visual_avgpool(visual)
+            visual = visual.view(visual.size(0), -1)
+            visual = F.relu(self.visual_fc(visual))  # (B, 128)
 
         # Pose stream
         batch_size, seq_len, _ = pose.shape
@@ -345,23 +571,25 @@ class MultimodalFusionModelLight(nn.Module):
 def create_multimodal_model(
     num_classes: int = 7,
     model_type: str = "standard",
-    device: str = "cuda"
+    device: str = "cuda",
+    use_dinov2: bool = True
 ) -> nn.Module:
     """
-    Create multimodal model instance.
+    Create multimodal model instance with DinoV2 support.
 
     Args:
         num_classes: Number of action classes
         model_type: "standard" or "light"
         device: Device to place model on
+        use_dinov2: Use DinoV2 visual encoder (True) or 3D CNN (False)
 
     Returns:
         Model instance on specified device
     """
     if model_type == "standard":
-        model = MultimodalFusionModel(num_classes=num_classes)
+        model = MultimodalFusionModel(num_classes=num_classes, use_dinov2=use_dinov2)
     elif model_type == "light":
-        model = MultimodalFusionModelLight(num_classes=num_classes)
+        model = MultimodalFusionModelLight(num_classes=num_classes, use_dinov2=use_dinov2)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 

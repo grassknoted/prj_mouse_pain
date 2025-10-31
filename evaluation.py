@@ -14,6 +14,7 @@ from sklearn.metrics import (
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
+from tqdm import tqdm
 
 
 # Class labels for reference
@@ -47,7 +48,10 @@ def evaluate(
     all_labels = []
 
     with torch.no_grad():
-        for clips, labels in val_loader:
+        # Create progress bar for validation
+        pbar = tqdm(val_loader, desc="Validation", leave=False)
+
+        for clips, labels in pbar:
             clips = clips.to(device)
             labels = labels.to(device)
 
@@ -59,6 +63,9 @@ def evaluate(
 
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+
+            # Update progress bar with running loss
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)

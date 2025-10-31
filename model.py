@@ -1,11 +1,12 @@
 """
-3D CNN model for action recognition.
-Designed to capture spatiotemporal features from grayscale video clips.
+Action recognition models with support for both 3D CNN and DinoV2 (frozen) + temporal modeling.
+DinoV2 model uses frozen pretrained features with Bi-GRU + Attention for temporal aggregation.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as transforms
 
 
 class Conv3DBlock(nn.Module):
@@ -64,7 +65,7 @@ class Mouse3DCNN(nn.Module):
     def __init__(
         self,
         num_classes: int = 7,
-        clip_length: int = 16,
+        clip_length: int = 17,
         input_height: int = 256,
         input_width: int = 256,
         dropout: float = 0.5
@@ -171,7 +172,7 @@ class Mouse3DCNNLight(nn.Module):
     def __init__(
         self,
         num_classes: int = 7,
-        clip_length: int = 16,
+        clip_length: int = 17,
         dropout: float = 0.4
     ):
         super(Mouse3DCNNLight, self).__init__()
@@ -219,25 +220,206 @@ class Mouse3DCNNLight(nn.Module):
         return x
 
 
+class DinoV2TemporalModel(nn.Module):
+    """
+    Action recognition model using frozen DinoV2 + Bi-GRU + Temporal Attention.
+
+    Architecture:
+    1. Frozen DinoV2-large encoder (per-frame feature extraction)
+    2. Bi-directional GRU for temporal modeling
+    3. Temporal attention for frame-wise importance weighting
+    4. FC classification head
+
+    Input: (B, T, H, W) or (B, 1, T, H, W) grayscale video clips
+    Output: (B, num_classes) action logits
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 7,
+        freeze_dinov2: bool = True,
+        dropout: float = 0.4
+    ):
+        super(DinoV2TemporalModel, self).__init__()
+
+        self.num_classes = num_classes
+        self.freeze_dinov2 = freeze_dinov2
+
+        # Lazy loading to avoid multi-process conflicts
+        self.dinov2 = None
+        self.dinov2_dim = 1024  # DinoV2-large output dimension
+
+        # Preprocessing for DinoV2 (expects 224x224 RGB images, normalized)
+        self.resize = transforms.Resize((224, 224), antialias=True)
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+
+        # Bi-directional GRU for temporal modeling
+        self.gru_hidden_dim = 512
+        self.bi_gru = nn.GRU(
+            input_size=self.dinov2_dim,
+            hidden_size=self.gru_hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout
+        )
+
+        # Temporal attention mechanism
+        self.temporal_attention = nn.Sequential(
+            nn.Linear(self.gru_hidden_dim * 2, 256),  # *2 for bidirectional
+            nn.Tanh(),
+            nn.Linear(256, 1)
+        )
+
+        # Classification head
+        self.fc1 = nn.Linear(self.gru_hidden_dim * 2, 512)
+        self.dropout1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(512, 256)
+        self.dropout2 = nn.Dropout(dropout)
+        self.fc_out = nn.Linear(256, num_classes)
+
+    def _load_dinov2(self):
+        """Lazy load DinoV2 model to avoid multi-process conflicts."""
+        if self.dinov2 is None:
+            import os
+            print("Loading DinoV2-large model for visual-only model...")
+            os.environ['TORCH_HOME'] = os.path.expanduser('~/.cache/torch')
+            self.dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', verbose=False, trust_repo=True)
+
+            # Freeze DinoV2 parameters
+            if self.freeze_dinov2:
+                for param in self.dinov2.parameters():
+                    param.requires_grad = False
+                self.dinov2.eval()
+
+            print("DinoV2 loaded successfully!")
+
+    def preprocess_frames(self, frames):
+        """
+        Memory-efficient preprocessing of grayscale frames for DinoV2.
+
+        Args:
+            frames: (B, T, H, W) grayscale frames in [0, 1]
+
+        Returns:
+            (B, T, 3, 224, 224) preprocessed RGB frames
+        """
+        B, T, H, W = frames.shape
+
+        # Process in a more memory-efficient way
+        # Convert grayscale to RGB by repeating channels
+        frames_rgb = frames.unsqueeze(2).expand(-1, -1, 3, -1, -1)  # (B, T, 3, H, W) - uses expand instead of repeat
+
+        # Resize and normalize all at once
+        frames_flat = frames_rgb.reshape(B * T, 3, H, W)  # (B*T, 3, H, W)
+        frames_resized = self.resize(frames_flat)  # (B*T, 3, 224, 224)
+        frames_normalized = self.normalize(frames_resized)  # (B*T, 3, 224, 224)
+
+        # Reshape back
+        frames_processed = frames_normalized.reshape(B, T, 3, 224, 224)
+        return frames_processed
+
+    def extract_dinov2_features(self, frames):
+        """
+        Extract DinoV2 features for each frame (memory-safe).
+
+        Args:
+            frames: (B, T, 3, 224, 224) preprocessed frames
+
+        Returns:
+            (B, T, 1024) DinoV2 features
+        """
+        B, T, C, H, W = frames.shape
+
+        # Reshape to process all frames in batch
+        frames_flat = frames.reshape(B * T, C, H, W)  # (B*T, 3, 224, 224)
+
+        # Extract features with frozen DinoV2 (always no_grad for frozen model)
+        self.dinov2.eval()  # Ensure eval mode
+        with torch.no_grad():
+            features = self.dinov2(frames_flat)  # (B*T, 1024)
+
+        # Reshape back to (B, T, 1024)
+        features = features.reshape(B, T, self.dinov2_dim)
+
+        return features
+
+    def forward(self, x):
+        """
+        Forward pass.
+
+        Args:
+            x: (B, T, H, W) or (B, 1, T, H, W) grayscale frames in [0, 1]
+
+        Returns:
+            logits: (B, num_classes)
+        """
+        # Lazy load DinoV2 on first forward pass
+        self._load_dinov2()
+
+        # Remove channel dimension if present
+        if x.dim() == 5:
+            x = x.squeeze(1)  # (B, T, H, W)
+
+        B, T, H, W = x.shape
+
+        # Preprocess frames for DinoV2
+        frames_processed = self.preprocess_frames(x)  # (B, T, 3, 224, 224)
+
+        # Extract DinoV2 features per frame
+        dinov2_features = self.extract_dinov2_features(frames_processed)  # (B, T, 1024)
+
+        # Apply Bi-GRU for temporal modeling
+        gru_out, _ = self.bi_gru(dinov2_features)  # (B, T, 1024) where 1024 = gru_hidden_dim * 2
+
+        # Temporal attention
+        attention_scores = self.temporal_attention(gru_out)  # (B, T, 1)
+        attention_weights = F.softmax(attention_scores, dim=1)  # (B, T, 1)
+
+        # Weighted sum of GRU outputs
+        attended_features = torch.sum(gru_out * attention_weights, dim=1)  # (B, 1024)
+
+        # Classification head
+        x = self.fc1(attended_features)
+        x = F.relu(x)
+        x = self.dropout1(x)
+
+        x = self.fc2(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+
+        x = self.fc_out(x)  # (B, num_classes)
+
+        return x
+
+
 def create_model(
     num_classes: int = 7,
     clip_length: int = 16,
     model_type: str = "standard",
-    device: str = "cuda"
+    device: str = "cuda",
+    use_dinov2: bool = True
 ) -> nn.Module:
     """
-    Create model instance.
+    Create model instance with DinoV2 support.
 
     Args:
         num_classes: Number of action classes
         clip_length: Temporal clip length
-        model_type: "standard" or "light"
+        model_type: "standard" or "light" (ignored when use_dinov2=True)
         device: Device to place model on
+        use_dinov2: Use DinoV2 temporal model (True) or 3D CNN (False)
 
     Returns:
         Model instance on specified device
     """
-    if model_type == "standard":
+    if use_dinov2:
+        # DinoV2-based temporal model (ignores model_type)
+        model = DinoV2TemporalModel(num_classes=num_classes)
+    elif model_type == "standard":
         model = Mouse3DCNN(num_classes=num_classes, clip_length=clip_length)
     elif model_type == "light":
         model = Mouse3DCNNLight(num_classes=num_classes, clip_length=clip_length)

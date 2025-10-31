@@ -1,448 +1,711 @@
 # Files Guide - What Each File Does
 
-## Core Pipeline Files
-
-### `data_loader.py` - Data Loading & Preprocessing
-**Purpose**: Loads videos and annotations, creates temporal training clips
-
-**Key Classes**:
-- `MouseActionDataset`: Loads video clips and returns (temporal_clip, label) pairs
-- Functions: `create_data_loaders()` to create train/val dataloaders
-
-**What it handles**:
-- ✓ Loads videos frame-by-frame on demand (memory efficient)
-- ✓ Extracts 16-frame temporal clips centered on target frame
-- ✓ Merges action classes (paw_guard + flinch → paw_withdraw)
-- ✓ Validates frame counts against annotations
-- ✓ Computes inverse-frequency class weights
-- ✓ Creates 80/20 train/val split at video level
-- ✓ Normalizes frames to [0,1]
-
-**Use when**:
-- Initializing training
-- Creating dataloaders in custom scripts
-- Debugging data issues
-
-**Example**:
-```python
-from data_loader import create_data_loaders
-train_loader, val_loader, class_weights = create_data_loaders(
-    "./Videos", "./Annotations", batch_size=32
-)
-```
+Complete guide to understanding the repository structure and what each file is responsible for.
 
 ---
 
-### `model.py` - Neural Network Architecture
-**Purpose**: Defines 3D CNN models for action recognition
+## Quick Navigation
 
-**Key Classes**:
-- `Conv3DBlock`: Reusable 3D conv + batch norm + activation
-- `Mouse3DCNN`: Full 4-layer 3D CNN (3M parameters)
-- `Mouse3DCNNLight`: Lightweight variant (600K parameters)
-- Function: `create_model()` factory function
-
-**Architecture Highlights**:
-- 4 blocks of 3D convolutions (32→64→128→256 channels)
-- Batch normalization and ReLU activations
-- Max pooling for spatial/temporal downsampling
-- Global average pooling for robustness
-- 2 fully connected layers with dropout
-
-**Use when**:
-- Training a model
-- Loading a saved checkpoint for inference
-- Experimenting with architecture changes
-
-**Example**:
-```python
-from model import create_model
-model = create_model(num_classes=7, clip_length=16, model_type="standard")
-```
+- [Python Files](#python-files)
+  - [Approach 1: Video-Only](#approach-1-video-only)
+  - [Approach 2: Multimodal](#approach-2-multimodal)
+  - [Approach 3: Multi-Task](#approach-3-multi-task-advanced)
+  - [Testing & Utilities](#testing--utilities)
+- [Shell Scripts](#shell-scripts)
+- [Documentation](#documentation)
+- [Configuration](#configuration)
 
 ---
 
-### `train.py` - Training Script
-**Purpose**: Complete training pipeline with all best practices
+## Python Files
 
-**Key Features**:
-- ✓ Weighted CrossEntropy loss (handles class imbalance)
-- ✓ Adam optimizer with cosine annealing + warm restarts
-- ✓ Automatic mixed precision (AMP) for 2x speedup
-- ✓ Gradient clipping (max norm 1.0)
-- ✓ Early stopping (patience=15)
-- ✓ Model checkpointing (saves best by F1 score)
-- ✓ TensorBoard logging for monitoring
-- ✓ Configuration saving (reproducibility)
+### Approach 1: Video-Only
 
-**Use when**:
-- Training from scratch
-- Fine-tuning an existing model
-- Running the complete training pipeline
+**Use Case**: Quick experiments, baseline 3D CNN approach
 
-**Run from command line**:
+#### `train.py` (14KB)
+**Purpose**: Training script for video-only 3D CNN model
+
+**Features**:
+- Weighted CrossEntropy loss
+- Adam optimizer with cosine annealing
+- Mixed precision training (AMP)
+- Gradient clipping
+- Early stopping
+- TensorBoard logging
+- Model checkpointing (saves best by F1)
+
+**Run**:
 ```bash
 python train.py
 ```
 
-**Or programmatically**:
-```python
-from train import train_model
-run_dir = train_model(
-    video_dir="./Videos",
-    annotation_dir="./Annotations",
-    num_epochs=100,
-    batch_size=32
-)
-```
+**Output**: `./checkpoints/run_YYYYMMDD_HHMMSS/best_model_epochN.pt`
 
 ---
 
-### `evaluation.py` - Evaluation & Metrics
-**Purpose**: Compute comprehensive evaluation metrics and create visualizations
+#### `model.py` (14KB)
+**Purpose**: 3D CNN architecture definitions
 
-**Key Functions**:
-- `evaluate()`: Compute all metrics on validation set
-- `compute_metrics()`: Calculate F1, precision, recall per class
-- `print_detailed_report()`: Sklearn classification report
-- `plot_confusion_matrix()`: Confusion matrix heatmap
-- `plot_per_class_metrics()`: Bar plots of precision/recall/F1
-- `plot_class_distribution()`: Class distribution histogram
-- `evaluate_and_save_results()`: Full evaluation pipeline
+**Classes**:
+- `Conv3DBlock`: Reusable 3D conv + batch norm + activation block
+- `Mouse3DCNN`: Standard model (3M parameters, 4 conv blocks)
+- `Mouse3DCNNLight`: Lightweight variant (600K parameters, 3 conv blocks)
+- `create_model()`: Factory function
 
-**Metrics Computed**:
-- F1 (macro, weighted, micro)
-- Precision & recall per class
-- Confusion matrix
-- Per-class F1 scores
-- Classification report
-
-**Use when**:
-- Evaluating trained models
-- Creating publication-quality figures
-- Analyzing per-class performance
-- Debugging model confusion patterns
-
-**Example**:
-```python
-from evaluation import evaluate_and_save_results
-evaluate_and_save_results(model, val_loader, device, "./results")
+**Architecture**:
 ```
+Input (B, 1, 16, H, W) → Conv3D(32→64→128→256) → GlobalAvgPool
+  → FC(512→256) → FC(7) → Logits
+```
+
+**Use When**: Need model for training or inference
 
 ---
 
-### `inference.py` - Make Predictions
-**Purpose**: Load trained models and make predictions on new videos
+#### `data_loader.py` (19KB)
+**Purpose**: Data loading and preprocessing pipeline
 
-**Key Classes**:
+**Classes**:
+- `MouseActionDataset`: Loads videos and creates temporal clips
+- `create_data_loaders()`: Creates train/val dataloaders
+
+**Features**:
+- On-the-fly video loading (memory efficient)
+- 16-frame temporal clips centered on target frame
+- Action class merging (paw_guard+flinch → paw_withdraw)
+- Inverse-frequency class weight computation
+- 80/20 train/val split at video level
+- Frame validation
+
+**Use When**: Initializing data for training
+
+---
+
+#### `inference.py` (7.5KB)
+**Purpose**: Make predictions on new videos
+
+**Classes**:
 - `ActionRecognitionInference`: Main inference wrapper
 
-**Key Methods**:
+**Methods**:
 - `predict_frame()`: Single frame prediction
 - `predict_video()`: Full video frame-by-frame predictions
 - `save_predictions()`: Save results to JSON
-
-**Function**:
-- `predict_multiple_videos()`: Batch prediction on many videos
-
-**Use when**:
-- Making predictions after training
-- Analyzing specific videos
-- Running inference pipeline on test set
-- Getting confidence scores for predictions
+- `predict_multiple_videos()`: Batch prediction
 
 **Example**:
 ```python
 from inference import ActionRecognitionInference
+
 inference = ActionRecognitionInference("./checkpoints/run_xxx/best_model.pt")
 predictions = inference.predict_video("./Videos/video_1.mp4", stride=2)
 ```
 
 ---
 
-## Documentation Files
+#### `evaluation.py` (8.6KB)
+**Purpose**: Compute metrics and create visualizations
 
-### `README.md` - Comprehensive Documentation
-**Read this for**: Complete guide covering everything
+**Functions**:
+- `evaluate()`: Compute metrics on validation set
+- `compute_metrics()`: F1, precision, recall per class
+- `plot_confusion_matrix()`: Confusion matrix heatmap
+- `plot_per_class_metrics()`: F1/precision/recall bar plots
+- `evaluate_and_save_results()`: Full evaluation pipeline
 
-**Sections**:
-- Overview of the project
-- Installation instructions
-- Data format specification
-- Quick start examples
-- Model architecture details
-- Training procedure
-- Evaluation metrics
-- Temporal clip strategy explanation
-- Tips for best results
-- Troubleshooting guide
-- Advanced usage examples
+**Metrics**:
+- F1 (macro, weighted, micro)
+- Precision & recall per class
+- Confusion matrix
+- Classification report
 
-**When to read**: Before starting, or when you have specific questions
+**Use When**: Evaluating trained models, creating publication figures
 
 ---
 
-### `QUICKSTART.md` - 5-Minute Start Guide
-**Read this for**: Getting running as fast as possible
+### Approach 2: Multimodal
 
-**Sections**:
-- Prerequisites checklist
-- Install (2 minutes)
-- Verify setup (1 minute)
-- Train model
-- Get predictions
-- Evaluate results
-- Common adjustments
-- Expected output
-- Troubleshooting
+**Use Case**: Have DeepLabCut pose data, want better pain detection
 
-**When to read**: When you just want to run the code
+#### `multimodal_train.py` (16KB)
+**Purpose**: Training script for dual-stream (visual + pose) model
 
----
+**Features**:
+- Same as `train.py` but loads visual + pose data
+- Dual-stream optimization
+- Multi-GPU support (DDP)
 
-### `IMPLEMENTATION_SUMMARY.md` - Design Rationale
-**Read this for**: Understanding WHY things are designed this way
+**Run**:
+```bash
+python multimodal_train.py
+```
 
-**Sections**:
-- Why 3D CNN instead of 2D
-- Why class weighting matters
-- Why 16-frame clips
-- Why temporal clipping strategy
-- Why global average pooling
-- Why cosine annealing
-- Design decisions & tradeoffs
-- Performance expectations
-- Advanced modifications
-
-**When to read**: When you want to understand the thinking behind the implementation
+**Data Requirements**:
+- Videos in `Videos/`
+- Action annotations in `Annotations/`
+- DLC CSVs in `DLC/`
 
 ---
 
-### `SYSTEM_OVERVIEW.md` - Visual Architecture
-**Read this for**: Seeing how all components fit together
+#### `multimodal_model.py` (20KB)
+**Purpose**: Dual-stream architecture
 
-**Sections**:
-- Full architecture diagram (training + inference)
-- Key design principles
-- Data flow example
-- What makes it publication-quality
-- Common pitfalls avoided
-- Expected performance ranges
-- Customization points
+**Classes**:
+- `PoseStream`: MLP + temporal attention for pose features
+- `MultimodalModel`: Combined visual + pose architecture
+- `create_multimodal_model()`: Factory function
 
-**When to read**: Getting a bird's-eye view of the system
-
----
-
-### `FILES_GUIDE.md` - This File
-**Read this for**: Understanding what each file does
+**Architecture**:
+```
+Visual: (B,1,16,H,W) → 3D CNN → 256D
+Pose: (B,16,18) → MLP+Attention → 256D
+  ↓
+Fusion: Concat(512) → MLP → 7 classes
+```
 
 ---
 
-## Testing & Debugging
+#### `multimodal_data_loader.py` (31KB)
+**Purpose**: Load visual + pose data
 
-### `test_pipeline.py` - System Verification
-**Purpose**: Quick tests to verify your setup works
+**Features**:
+- Loads videos AND DLC keypoint CSVs
+- Extracts 18 pose features (8 edges + 10 angles)
+- Synchronized visual + pose temporal clips
+- Handles missing/low-confidence keypoints
+
+**Use When**: Training or evaluating multimodal models
+
+---
+
+#### `multimodal_inference.py` (11KB)
+**Purpose**: Inference for multimodal models
+
+**Classes**:
+- `MultimodalActionRecognitionInference`: Inference wrapper
+
+**Requires**: Both video + DLC CSV for prediction
+
+**Example**:
+```python
+from multimodal_inference import MultimodalActionRecognitionInference
+
+inference = MultimodalActionRecognitionInference("checkpoint.pt")
+predictions = inference.predict_video(
+    "video.mp4",
+    "video_dlc.csv",
+    stride=2
+)
+```
+
+---
+
+#### `pose_graph.py` (2.4KB)
+**Purpose**: Kinematic feature extraction from keypoints
+
+**Class**:
+- `PoseGraph`: Computes geometric features
+
+**Features Extracted**:
+- 8 edge lengths (normalized distances)
+- 10 angles (joint angles in radians)
+- Total: 18 features per frame
+
+**Keypoint Order**: `[mouth, tail_base, L_front, R_front, L_hind, R_hind]`
+
+---
+
+### Approach 3: Multi-Task (Advanced)
+
+**Use Case**: State-of-the-art performance, production deployment
+
+#### `train_multitask.py` (96KB) ⭐
+**Purpose**: Comprehensive multi-task training pipeline
+
+**This is the most advanced training script with everything.**
+
+**Features**:
+- **Backbones**: VideoMAE2 (3D) or ViT (2D + temporal pooling)
+- **Temporal Head**: TCN with dilated convolutions
+- **Model Types**: Action-only or multi-task (action + keypoint regression)
+- **Pose Graph**: 18 geometric features from 6 keypoints
+- **Advanced Training**:
+  - Focal loss (gamma=2.5)
+  - Rare-class boosting (up to 30x)
+  - Label smoothing (0.1)
+  - Comprehensive augmentation (brightness, contrast, temporal dropout, keypoint jitter)
+  - EMA (exponential moving average)
+  - Early stopping
+  - Warmup + backbone freezing
+- **Data Handling**:
+  - 345 or 360-frame annotations
+  - Variable trial lengths
+  - Invalid trial skipping
+  - Robust DLC parsing
+- **Monitoring**:
+  - W&B logging with auto-generated run names
+  - tqdm progress bars
+  - Detailed metrics logging
+
+**Run (Action-Only)**:
+```bash
+python train_multitask.py \
+    --annotations ./Annotations \
+    --videos ./Videos \
+    --model_type action_only \
+    --epochs 50 \
+    --batch_size 2
+```
+
+**Run (Multi-Task)**:
+```bash
+python train_multitask.py \
+    --annotations ./Annotations \
+    --videos ./Videos \
+    --model_type multitask \
+    --epochs 50 \
+    --batch_size 2 \
+    --use_wandb
+```
+
+**Output**: `./best_model_multitask.pt`
+
+**Detailed Guide**: See [MULTITASK_GUIDE.md](MULTITASK_GUIDE.md)
+
+---
+
+### Testing & Utilities
+
+#### `test_pipeline.py` (5.8KB)
+**Purpose**: Verify video-only setup
 
 **Tests**:
-1. Data loading (can load videos/annotations)
-2. Model creation (model builds without errors)
-3. Metrics computation (metrics work correctly)
-4. Light model variant (memory-efficient model works)
-
-**Use when**:
-- Setting up for the first time
-- Debugging data issues
-- Verifying dependencies installed correctly
+1. Data loading (videos + annotations)
+2. Model creation and forward pass
+3. Metrics computation
+4. Lightweight model variant
 
 **Run**:
 ```bash
 python test_pipeline.py
 ```
 
-**Output example**:
+**Expected Output**:
 ```
 ✓ Data loading test PASSED
 ✓ Model architecture test PASSED
 ✓ Metrics test PASSED
 ✓ Lightweight Model test PASSED
-✓ All tests passed! Ready to train.
 ```
 
 ---
 
-## Configuration & Dependencies
+#### `test_updated_loaders.py` (3.8KB)
+**Purpose**: Test data loaders after updates
 
-### `requirements.txt` - Python Dependencies
-**Purpose**: Lists all required packages and versions
+**Run**:
+```bash
+python test_updated_loaders.py
+```
 
-**Packages**:
-- `torch`, `torchvision`: Deep learning framework
-- `opencv-python`: Video reading
-- `numpy`, `pandas`: Data manipulation
-- `scikit-learn`: Metrics & preprocessing
-- `matplotlib`, `seaborn`: Visualization
-- `tensorboard`: Training monitoring
+---
 
-**Use when**:
+#### `test_multitask_data.py` (2.8KB)
+**Purpose**: Test multi-task data loading
+
+**Validates**:
+- Video loading
+- Action CSV loading
+- DLC CSV loading
+- Pose graph computation
+- Trial discovery
+
+**Run**:
+```bash
+python test_multitask_data.py
+```
+
+---
+
+#### `validate_data_structure.py` (3.9KB)
+**Purpose**: Validate data organization
+
+**Checks**:
+- Video files exist
+- Annotations match videos
+- Frame counts are correct
+- DLC files present (if needed)
+
+**Run**:
+```bash
+python validate_data_structure.py
+```
+
+---
+
+#### `validate_simple.py` (3.3KB)
+**Purpose**: Simple validation script
+
+**Run**:
+```bash
+python validate_simple.py
+```
+
+---
+
+#### `debug_dlc_csv.py` (2.1KB)
+**Purpose**: Inspect and debug DLC CSV files
+
+**Usage**:
+```bash
+python debug_dlc_csv.py path/to/dlc.csv
+```
+
+**Output**:
+- Header structure
+- Keypoint names
+- Coordinate ranges
+- Missing values
+- Likelihood statistics
+
+---
+
+#### `extract_frames.py` (4.2KB)
+**Purpose**: Extract frames from videos
+
+**Usage**:
+```bash
+python extract_frames.py video.mp4 output_dir/
+```
+
+---
+
+#### `check_annotations.py` (2.5KB)
+**Purpose**: Check annotation file validity
+
+**Validates**:
+- CSV format
+- Frame indices
+- Action values in range
+- Row count
+
+---
+
+#### Preprocessing Scripts (Legacy)
+
+- `new_preprocess_data.py` (5.7KB): Old preprocessing
+- `preprocess_final.py` (7.3KB): Final preprocessing version
+- `reorganize_data.py` (9.6KB): Reorganize data structure
+
+**Note**: These are legacy scripts. Current pipelines handle preprocessing automatically.
+
+---
+
+## Shell Scripts
+
+### `train_multigpu.sh` (1.9KB)
+**Purpose**: Multi-GPU training for video-only
+
+**Usage**:
+```bash
+bash train_multigpu.sh
+```
+
+Uses `torch.distributed` for multi-GPU training.
+
+---
+
+### `train_multimodal_multigpu.sh` (2.0KB)
+**Purpose**: Multi-GPU training for multimodal
+
+**Usage**:
+```bash
+bash train_multimodal_multigpu.sh
+```
+
+---
+
+### `extract_all_frames.sh` (853B)
+**Purpose**: Batch extract frames from all videos
+
+**Usage**:
+```bash
+bash extract_all_frames.sh
+```
+
+---
+
+## Documentation
+
+### Main Guides
+
+| File | Lines | Purpose | Read When |
+|------|-------|---------|-----------|
+| **README.md** | 515 | Overview of all approaches | Starting out |
+| **QUICKSTART.md** | 253 | 5-min video-only tutorial | Quick start |
+| **MULTIMODAL_QUICKSTART.md** | 171 | 5-min multimodal tutorial | Have pose data |
+| **MULTIMODAL_GUIDE.md** | 419 | Comprehensive multimodal guide | Deep dive multimodal |
+| **MULTITASK_GUIDE.md** | 670 | Comprehensive multi-task guide | Using advanced approach |
+| **FILES_GUIDE.md** | This file | What each file does | Understanding codebase |
+| **SYSTEM_OVERVIEW.md** | 341 | Architecture diagrams | Visual learner |
+| **IMPLEMENTATION_SUMMARY.md** | 250 | Design decisions | Understanding why |
+| **DELIVERABLES.md** | 442 | Implementation checklist | Project completion |
+| **CHANGELOG.md** | 750 | Technical fixes & updates | Troubleshooting |
+
+### Technical Documentation (Archive)
+
+These files are now consolidated into CHANGELOG.md:
+
+- `CLIP_LENGTH_FIX.md` → See CHANGELOG.md
+- `DATA_STATISTICS_EXPLANATION.md` → See CHANGELOG.md
+- `FIXES_SUMMARY.md` → See CHANGELOG.md
+- `GRADIENT_TRACKING_FIX.md` → See CHANGELOG.md
+- `MULTITASK_IMPROVEMENTS.md` → See CHANGELOG.md
+- `MULTITASK_TRAINING_FIXED.md` → See CHANGELOG.md
+- `MULTI_GPU_TRAINING.md` → See CHANGELOG.md
+- `MULTI_TRIAL_UPDATE.md` → See CHANGELOG.md
+- `POSE_GRAPH_AND_MODEL_TYPES.md` → See CHANGELOG.md
+- `SKIPPING_INVALID_TRIALS.md` → See CHANGELOG.md
+- `TORCH_UINT8_FIX.md` → See CHANGELOG.md
+- `TQDM_PROGRESS_BARS.md` → See CHANGELOG.md
+- `VARIABLE_TRIAL_LENGTHS.md` → See CHANGELOG.md
+- `VIDEOMAE_HUGGINGFACE_UPDATE.md` → See CHANGELOG.md
+- `WANDB_LOGGING.md` → See CHANGELOG.md
+
+**Recommendation**: These files can be archived or deleted as their content is now in [CHANGELOG.md](CHANGELOG.md).
+
+---
+
+## Configuration
+
+### `requirements.txt` (156B)
+**Purpose**: Python package dependencies
+
+**Core Dependencies**:
+```
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tensorboard>=2.14.0
+```
+
+**Optional**:
+```
+transformers  # For VideoMAE2
+wandb         # For experiment tracking
+timm          # For ViT backbones (multi-task)
+```
+
+**Install**:
 ```bash
 pip install -r requirements.txt
+pip install transformers wandb timm  # Optional
 ```
 
 ---
 
-## File Dependencies Graph
+### `.gitignore`
+**Purpose**: Git ignore rules
+
+Ignores:
+- `checkpoints/`, `checkpoints_multimodal/`
+- `__pycache__/`, `*.pyc`
+- `wandb/`
+- `*.pt`, `*.pth` (model checkpoints)
+- `Videos/`, `Annotations/`, `DLC/` (data directories)
+
+---
+
+## File Dependency Graph
 
 ```
-┌──────────────────────────────────────────┐
-│         Data Files                       │
-│  (Videos/ and Annotations/)              │
-└───────────────────────┬──────────────────┘
-                        │
-                        ▼
-           ┌────────────────────────┐
-           │   data_loader.py       │
-           │  (loads data)          │
-           └─────────┬──────────────┘
-                     │
-         ┌───────────┴──────────────┐
-         │                          │
-         ▼                          ▼
-    ┌─────────────┐         ┌──────────────┐
-    │ train.py    │         │ inference.py │
-    │(training)   │         │(predictions) │
-    └──────┬──────┘         └──────┬───────┘
-           │                       │
-           └───────────┬───────────┘
-                       │
-         ┌─────────────▼─────────────┐
-         │  model.py                 │
-         │  (neural network)         │
-         └─────────────┬─────────────┘
-                       │
-         ┌─────────────▼─────────────┐
-         │  evaluation.py            │
-         │  (metrics & plots)        │
-         └───────────────────────────┘
+DATA (Videos/, Annotations/, DLC/)
+  │
+  ├─→ APPROACH 1: Video-Only
+  │   └─→ data_loader.py → model.py → train.py → evaluation.py
+  │       └─→ inference.py
+  │
+  ├─→ APPROACH 2: Multimodal
+  │   └─→ pose_graph.py → multimodal_data_loader.py → multimodal_model.py
+  │       └─→ multimodal_train.py → evaluation.py
+  │       └─→ multimodal_inference.py
+  │
+  └─→ APPROACH 3: Multi-Task
+      └─→ train_multitask.py (self-contained, includes pose graph)
 ```
 
 ---
 
-## Typical Workflow
+## Typical Workflows
 
-### First Time Setup
-```
-1. Read QUICKSTART.md
-2. pip install -r requirements.txt
-3. Run test_pipeline.py
-4. Run train.py
-```
+### Workflow 1: Video-Only Training
 
-### During Training
 ```
-1. Monitor with: tensorboard --logdir=./checkpoints
-2. Watch loss decrease and F1 increase
-3. Training auto-stops with early stopping
+1. Install dependencies: pip install -r requirements.txt
+2. Organize data: Videos/, Annotations/
+3. Validate: python test_pipeline.py
+4. Train: python train.py
+5. Monitor: tensorboard --logdir=./checkpoints
+6. Inference: python inference.py
+7. Evaluate: python evaluation.py
 ```
 
-### After Training
-```
-1. Load best model from checkpoints/
-2. Run inference.py on validation videos
-3. Use evaluation.py to get metrics & plots
-```
-
-### For Understanding
-```
-1. Read SYSTEM_OVERVIEW.md for architecture
-2. Read IMPLEMENTATION_SUMMARY.md for why decisions
-3. Read README.md for comprehensive details
-4. Look at code comments for implementation details
-```
+**Files Used**:
+- `requirements.txt`
+- `test_pipeline.py`
+- `train.py`, `model.py`, `data_loader.py`
+- `inference.py`
+- `evaluation.py`
 
 ---
 
-## Which File Should I Look At?
+### Workflow 2: Multimodal Training
 
-| Question | File |
-|----------|------|
-| How do I get started? | `QUICKSTART.md` |
-| How does the system work? | `SYSTEM_OVERVIEW.md` |
-| Why were things designed this way? | `IMPLEMENTATION_SUMMARY.md` |
-| What's the full documentation? | `README.md` |
-| How do I train a model? | `train.py` |
-| How do I make predictions? | `inference.py` |
-| How do I evaluate results? | `evaluation.py` |
-| How is data loaded? | `data_loader.py` |
-| What's the model architecture? | `model.py` |
-| Is my setup correct? | `test_pipeline.py` |
-| What packages do I need? | `requirements.txt` |
+```
+1. Install dependencies: pip install -r requirements.txt
+2. Organize data: Videos/, Annotations/, DLC/
+3. Train: python multimodal_train.py
+4. Monitor: tensorboard --logdir=./checkpoints_multimodal
+5. Inference: python multimodal_inference.py
+6. Evaluate: python evaluation.py
+```
+
+**Files Used**:
+- `requirements.txt`
+- `multimodal_train.py`, `multimodal_model.py`, `multimodal_data_loader.py`
+- `pose_graph.py`
+- `multimodal_inference.py`
+- `evaluation.py`
+
+---
+
+### Workflow 3: Multi-Task Training
+
+```
+1. Install all dependencies: pip install -r requirements.txt transformers wandb
+2. Organize data: Videos/, Annotations/ (DLC CSVs in Videos/)
+3. Test data: python test_multitask_data.py
+4. Train: python train_multitask.py --use_wandb
+5. Monitor: wandb dashboard OR local metrics
+6. Use checkpoint: ./best_model_multitask.pt
+```
+
+**Files Used**:
+- `requirements.txt`
+- `test_multitask_data.py`
+- `train_multitask.py` (everything else is inside)
+
+---
+
+## Which File Should I Use?
+
+| Question | File/Command |
+|----------|--------------|
+| Start training (video-only) | `python train.py` |
+| Start training (multimodal) | `python multimodal_train.py` |
+| Start training (advanced) | `python train_multitask.py` |
+| Make predictions (video-only) | `inference.py` |
+| Make predictions (multimodal) | `multimodal_inference.py` |
+| Compute metrics | `evaluation.py` |
+| Test setup | `test_pipeline.py` |
+| Debug DLC files | `debug_dlc_csv.py` |
+| Multi-GPU training | `train_multigpu.sh` or `train_multimodal_multigpu.sh` |
+| Check data validity | `validate_data_structure.py` |
+| Extract video frames | `extract_frames.py` |
+| Understand architecture | `model.py` or `multimodal_model.py` |
+| Understand data loading | `data_loader.py` or `multimodal_data_loader.py` |
 
 ---
 
 ## File Sizes & Complexity
 
-| File | Lines | Purpose | Complexity |
-|------|-------|---------|------------|
-| `data_loader.py` | ~300 | Data pipeline | ⭐⭐⭐ |
-| `model.py` | ~250 | Neural network | ⭐⭐ |
-| `train.py` | ~300 | Training loop | ⭐⭐⭐ |
-| `evaluation.py` | ~400 | Metrics & plots | ⭐⭐ |
-| `inference.py` | ~250 | Predictions | ⭐⭐ |
-| `test_pipeline.py` | ~200 | Testing | ⭐ |
-
-Total: ~1700 lines of well-documented production code.
+| File | Size | Complexity | Lines |
+|------|------|------------|-------|
+| `train_multitask.py` | 96KB | ⭐⭐⭐⭐⭐ | ~1850 |
+| `multimodal_data_loader.py` | 31KB | ⭐⭐⭐⭐ | ~750 |
+| `multimodal_model.py` | 20KB | ⭐⭐⭐ | ~500 |
+| `data_loader.py` | 19KB | ⭐⭐⭐ | ~450 |
+| `multimodal_train.py` | 16KB | ⭐⭐⭐ | ~400 |
+| `model.py` | 14KB | ⭐⭐ | ~350 |
+| `train.py` | 14KB | ⭐⭐⭐ | ~350 |
+| `multimodal_inference.py` | 11KB | ⭐⭐ | ~275 |
+| `evaluation.py` | 8.6KB | ⭐⭐ | ~220 |
+| `inference.py` | 7.5KB | ⭐⭐ | ~190 |
 
 ---
 
-## Generated Output Files
+## Output Files Generated
 
-After running, you'll get:
+### After Training
+
+**Video-Only**:
+```
+checkpoints/run_YYYYMMDD_HHMMSS/
+├── best_model_epochN.pt
+├── config.json
+└── events.out.tfevents.*  (TensorBoard logs)
+```
+
+**Multimodal**:
+```
+checkpoints_multimodal/run_YYYYMMDD_HHMMSS/
+├── best_model_epochN.pt
+├── config.json
+└── events.out.tfevents.*
+```
+
+**Multi-Task**:
+```
+./best_model_multitask.pt
+wandb/run-YYYYMMDD_HHMMSS-*/  (if --use_wandb)
+```
+
+### After Inference
 
 ```
-checkpoints/
-├── run_20240101_120000/          ← One per training run
-│   ├── best_model_epoch50.pt     ← Load this for inference
-│   ├── config.json               ← Hyperparameters used
-│   └── events.out.tfevents.*     ← TensorBoard logs
-
 predictions/
-├── video_001_predictions.json    ← Frame-level predictions
+├── video_001_predictions.json
 ├── video_002_predictions.json
 └── ...
+```
 
+### After Evaluation
+
+```
 results/
-├── metrics.txt                   ← Detailed metrics
-├── confusion_matrix.png          ← Confusion visualization
-├── per_class_metrics.png         ← F1/precision/recall plots
-└── class_distribution.png        ← Class histogram
+├── metrics.txt
+├── confusion_matrix.png
+├── per_class_metrics.png
+└── class_distribution.png
 ```
 
 ---
 
-## Best Practices for File Organization
+## Summary
 
-```
-prj_mouse_pain/
-├── Videos/                  ← Your 1000 videos here
-├── Annotations/             ← Your 1000 CSV files here
-├── checkpoints/             ← Generated during training
-├── predictions/             ← Generated during inference
-├── results/                 ← Generated during evaluation
-│
-├── data_loader.py           ← Core pipeline files
-├── model.py
-├── train.py
-├── evaluation.py
-├── inference.py
-├── test_pipeline.py
-│
-├── requirements.txt         ← Dependencies
-├── README.md                ← Main documentation
-├── QUICKSTART.md            ← 5-minute guide
-├── IMPLEMENTATION_SUMMARY.md ← Design rationale
-├── SYSTEM_OVERVIEW.md       ← Architecture diagrams
-└── FILES_GUIDE.md           ← This file
-```
+**Total Python Files**: 20+
+**Total Documentation**: 10 main + 15 archived
+**Total Lines of Code**: ~7000+
+**Total Documentation Lines**: ~4000+
 
-Good luck with your research!
+**Most Important Files**:
+1. `README.md` - Start here
+2. `train.py` / `multimodal_train.py` / `train_multitask.py` - Training
+3. `model.py` / `multimodal_model.py` - Architectures
+4. `data_loader.py` / `multimodal_data_loader.py` - Data pipelines
+5. `evaluation.py` - Metrics & analysis
+
+**For Quick Start**:
+- Beginners → [QUICKSTART.md](QUICKSTART.md)
+- Have pose data → [MULTIMODAL_QUICKSTART.md](MULTIMODAL_QUICKSTART.md)
+- Advanced users → [MULTITASK_GUIDE.md](MULTITASK_GUIDE.md)
+
+---
+
+Good luck with your mouse pain detection research! 🐭🔬
