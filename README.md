@@ -163,6 +163,108 @@ Videos/              # <video>DLC_resnet50_....csv files (pose data)
 
 **Detailed Guide**: See [MULTITASK_GUIDE.md](MULTITASK_GUIDE.md)
 
+**Inference**:
+```bash
+python inference.py /path/to/video_folder
+```
+
+See the [Inference](#inference) section below for detailed usage.
+
+---
+
+## Inference
+
+After training your model with `train_multitask.py`, use the `inference.py` script to run predictions on new videos.
+
+### Requirements
+
+- Trained model checkpoint: `best_model_multitask.pt` (automatically saved during training)
+- Video files and their corresponding DLC annotation CSVs in the same folder
+
+### Usage
+
+```bash
+python inference.py /path/to/video_folder
+```
+
+### Input Format
+
+Your input folder should contain:
+- Video files (`.mp4`, `.avi`, `.mov`, etc.)
+- Corresponding DLC CSV files with pattern: `{video_name}DLC_resnet50_pawtracking_*.csv`
+
+Example folder structure:
+```
+my_videos/
+├── video1.mp4
+├── video1DLC_resnet50_pawtracking_bottompawDec15shuffle1_1030000.csv
+├── video2.mp4
+├── video2DLC_resnet50_pawtracking_bottompawDec15shuffle1_1030000.csv
+└── ...
+```
+
+### Output Format
+
+The script creates a new folder: `predictions_{input_folder_name}/`
+
+Each video gets a CSV file with predictions:
+- `Frame`: Frame number (0-indexed)
+- `Action`: Predicted action label (e.g., "rest", "paw_withdraw")
+- `{class}_prob`: Probability for each action class (0-1)
+
+Example output CSV:
+```csv
+Frame,Action,rest_prob,paw_withdraw_prob,paw_lick_prob,paw_shake_prob,walk_prob,active_prob
+0,rest,0.95,0.02,0.01,0.01,0.00,0.01
+1,rest,0.94,0.03,0.01,0.01,0.00,0.01
+2,paw_withdraw,0.10,0.85,0.02,0.01,0.01,0.01
+...
+```
+
+### Options
+
+```bash
+# Specify custom checkpoint location
+python inference.py /path/to/videos --checkpoint /path/to/model.pt
+
+# Force CPU inference
+python inference.py /path/to/videos --device cpu
+
+# Force GPU inference
+python inference.py /path/to/videos --device cuda
+```
+
+### Example
+
+```bash
+# Run inference on all videos in a folder
+python inference.py ../REMY2/TEST_VIDEOS
+
+# Output will be saved to:
+# ../REMY2/predictions_TEST_VIDEOS/
+```
+
+### Troubleshooting
+
+**"Checkpoint not found"**:
+- Make sure `best_model_multitask.pt` is in your current working directory
+- Or specify the path with `--checkpoint /path/to/checkpoint.pt`
+
+**"No DLC CSV found"**:
+- Ensure DLC CSV files are in the same folder as videos
+- Check that filenames match the pattern: `{video_stem}DLC_resnet50_*.csv`
+- The video stem must match exactly (e.g., `video1.mp4` → `video1DLC_...csv`)
+
+**"Frame mismatch"**:
+- Video and DLC CSV have different frame counts
+- The script will automatically truncate to the minimum length
+- Check your DLC tracking for completeness
+
+**Out of memory**:
+- Very long videos may cause OOM errors
+- Try using `--device cpu` for CPU inference
+- Or split long videos into shorter segments
+
 ---
 
 ## Project Structure
