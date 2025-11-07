@@ -1703,11 +1703,13 @@ def compute_frame_metrics(
             class_f1s.append(0.0)
             continue
 
-        # Search for best threshold
+        # Search for best threshold with two-stage search (coarse + fine)
         best_thr = 0.5
         best_f1 = 0.0
 
-        for thr in np.linspace(0.1, 0.9, 17):
+        # Stage 1: Coarse search across wider range
+        coarse_thresholds = np.linspace(0.05, 0.95, 19)  # Include extremes
+        for thr in coarse_thresholds:
             preds = (class_probs >= thr).astype(int)
             tp = ((preds == 1) & (class_targets == 1)).sum()
             fp = ((preds == 1) & (class_targets == 0)).sum()
@@ -1720,6 +1722,28 @@ def compute_frame_metrics(
             if f1 > best_f1:
                 best_f1 = f1
                 best_thr = thr
+
+        # Stage 2: Fine search around best threshold
+        if best_f1 > 0:
+            fine_thresholds = np.linspace(max(0.01, best_thr - 0.1),
+                                         min(0.99, best_thr + 0.1), 21)
+            for thr in fine_thresholds:
+                preds = (class_probs >= thr).astype(int)
+                tp = ((preds == 1) & (class_targets == 1)).sum()
+                fp = ((preds == 1) & (class_targets == 0)).sum()
+                fn = ((preds == 0) & (class_targets == 1)).sum()
+
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_thr = thr
+
+        # For minority classes with few samples, bias toward recall (lower threshold)
+        if class_targets.sum() < 100:  # Fewer than 100 positive samples
+            best_thr = best_thr * 0.8  # Lower threshold to increase recall
 
         best_thresholds.append(best_thr)
         class_f1s.append(best_f1)
@@ -1760,7 +1784,7 @@ def train_epoch(
     device: torch.device,
     ema_model=None
 ):
-    """Train for one epoch."""
+    """Train for one epoch with gradient accumulation."""
     model.train()
 
     total_loss = 0.0
@@ -1768,9 +1792,12 @@ def train_epoch(
     total_kp_loss = 0.0
     num_batches = 0
 
+    # Initialize gradients
+    optimizer.zero_grad()
+
     pbar = tqdm(loader, desc="Training", leave=False)
 
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         video = batch['video'].to(device)  # (B, T, 3, H, W)
         actions = batch['actions'].to(device)  # (B, T, C)
         action_mask = batch['action_mask'].to(device)  # (B,)
@@ -1778,8 +1805,6 @@ def train_epoch(
         keypoints = batch['keypoints'].to(device)  # (B, T, 2K)
         visibility = batch['visibility'].to(device)  # (B, T, K)
         time_feats = batch['time_feats'].to(device)  # (B, T, 2)
-
-        optimizer.zero_grad()
 
         with torch.amp.autocast('cuda', enabled=args.use_amp, dtype=torch.bfloat16 if args.use_amp else torch.float32):
             # Forward - handle both model types
@@ -1813,26 +1838,33 @@ def train_epoch(
                 kp_loss = 0.0 * logits_act.sum()
                 loss = action_loss
 
+            # Scale loss by gradient accumulation steps
+            loss = loss / args.gradient_accumulation_steps
+
         # Backward (skip if loss doesn't require grad, e.g., all samples invalid)
         if loss.requires_grad:
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+
+            # Only step optimizer every N accumulation steps
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
         else:
             # Skip optimization step if no gradients
             logger.warning("[warn] Skipping optimization step: loss doesn't require grad")
 
-        # Update EMA
-        if ema_model is not None:
+        # Update EMA (only on optimizer steps, not every batch)
+        if ema_model is not None and ((batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(loader)):
             for ema_param, param in zip(ema_model.parameters(), model.parameters()):
                 ema_param.data.mul_(args.ema_decay).add_(param.data, alpha=1 - args.ema_decay)
 
-        # Track metrics
-        total_loss += loss.item()
-        total_action_loss += action_loss.item()
-        total_kp_loss += kp_loss.item()
+        # Track metrics (multiply back by gradient_accumulation_steps for proper logging)
+        total_loss += loss.item() * args.gradient_accumulation_steps
+        total_action_loss += action_loss.item() * args.gradient_accumulation_steps
+        total_kp_loss += kp_loss.item() * args.gradient_accumulation_steps
         num_batches += 1
 
         # Update progress bar
@@ -1992,7 +2024,8 @@ def main():
 
     # Training
     parser.add_argument('--epochs', type=int, default=30, help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size (increased from 2 for better gradient estimates)')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Accumulate gradients over N batches (effective_batch_size = batch_size * N)')
     parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate (decreased for better convergence)')
     parser.add_argument('--weight_decay', type=float, default=5e-2, help='Weight decay (increased for better regularization)')
     parser.add_argument('--seed', type=int, default=123, help='Random seed')
@@ -2001,12 +2034,12 @@ def main():
     parser.add_argument('--model_type', type=str, default='multitask', choices=['action_only', 'multitask'],
                        help='Model type: action_only (actions from visual+pose) or multitask (actions+keypoints)')
     parser.add_argument('--freeze_backbone_epochs', type=int, default=3, help='Epochs to freeze backbone')
-    parser.add_argument('--focal_gamma', type=float, default=2.5, help='Focal loss gamma (increased for better focus on hard examples)')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal loss gamma (reduced from 2.5 for better minority class learning)')
     parser.add_argument('--lambda_smooth', type=float, default=5e-4, help='Temporal smoothness weight')
     parser.add_argument('--lambda_kp', type=float, default=1.0, help='Keypoint loss weight (only for multitask model)')
     parser.add_argument('--dropout', type=float, default=0.3, help='TCN dropout')
     parser.add_argument('--head_dropout', type=float, default=0.2, help='Task head dropout')
-    parser.add_argument('--label_smoothing', type=float, default=0.1, help='Label smoothing factor')
+    parser.add_argument('--label_smoothing', type=float, default=0.0, help='Label smoothing factor (disabled by default, conflicts with focal loss)')
 
     # Temporal
     parser.add_argument('--train_T', type=int, default=180, help='Train window length')
@@ -2022,7 +2055,7 @@ def main():
     # Dataset
     parser.add_argument('--min_frames', type=int, default=345, help='Minimum frames required (345 for 15-frame context window annotations)')
     parser.add_argument('--rare_threshold_share', type=float, default=0.02, help='Rare class threshold')
-    parser.add_argument('--rare_boost_cap', type=float, default=30.0, help='Max rare class boost factor (increased from 12)')
+    parser.add_argument('--rare_boost_cap', type=float, default=50.0, help='Max rare class boost factor (increased from 30 for stronger minority class boosting)')
 
     # Data Augmentation
     parser.add_argument('--kp_jitter_std', type=float, default=0.02, help='Keypoint jitter std (0=disabled)')
@@ -2032,14 +2065,15 @@ def main():
     parser.add_argument('--aug_hflip', type=float, default=0.0, help='Horizontal flip probability (disabled for left/right keypoints)')
 
     # Scheduler
-    parser.add_argument('--warmup_epochs', type=int, default=10, help='Warmup epochs (increased from 3)')
+    parser.add_argument('--warmup_epochs', type=int, default=5, help='Warmup epochs (reduced from 10 to reach peak LR faster)')
     parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum LR')
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'plateau'], help='LR schedule type')
     parser.add_argument('--lr_patience', type=int, default=10, help='ReduceLROnPlateau patience (epochs)')
     parser.add_argument('--lr_factor', type=float, default=0.5, help='ReduceLROnPlateau factor')
 
     # Early Stopping
-    parser.add_argument('--early_stopping_patience', type=int, default=20, help='Early stopping patience (epochs, 0=disabled)')
+    parser.add_argument('--early_stopping_patience', type=int, default=30, help='Early stopping patience (epochs, 0=disabled, increased from 20 for minority class convergence)')
+    parser.add_argument('--min_minority_f1', type=float, default=0.3, help='Minimum F1 for minority classes before allowing early stopping')
 
     # EMA
     parser.add_argument('--use_ema', action='store_true', help='Use EMA')
@@ -2260,11 +2294,63 @@ def main():
     logger.info("=" * 80)
     logger.info("")
 
+    # Compute sample weights for WeightedRandomSampler
+    # This ensures minority classes appear in more batches
+    logger.info("Computing sample weights for weighted sampling...")
+    class_sample_counts = Counter()
+    sample_dominant_classes = []
+
+    for sample in train_dataset.samples:
+        if sample['action_csv'] is not None:
+            try:
+                df = pd.read_csv(sample['action_csv'])
+                sample_class_counts = Counter()
+                for action_idx in df['Action'].values:
+                    if isinstance(action_idx, (int, np.integer)) and action_idx < len(train_dataset.orig_classes):
+                        merged_idx = train_dataset.col_map[action_idx]
+                        merged_class = train_dataset.merged_classes[merged_idx]
+                        sample_class_counts[merged_class] += 1
+
+                if sample_class_counts:
+                    # Determine dominant class in this sample (most frequent)
+                    dominant_class = sample_class_counts.most_common(1)[0][0]
+                    sample_dominant_classes.append(dominant_class)
+                    class_sample_counts[dominant_class] += 1
+                else:
+                    sample_dominant_classes.append(None)
+            except:
+                sample_dominant_classes.append(None)
+        else:
+            sample_dominant_classes.append(None)
+
+    # Compute inverse frequency weights for each sample
+    sample_weights = []
+    total_samples = sum(class_sample_counts.values())
+
+    for dominant_class in sample_dominant_classes:
+        if dominant_class is not None and dominant_class in class_sample_counts:
+            class_count = class_sample_counts[dominant_class]
+            # Inverse frequency weight (with sqrt to prevent extreme values)
+            weight = np.sqrt(total_samples / (class_count * len(train_dataset.merged_classes)))
+            sample_weights.append(weight)
+        else:
+            sample_weights.append(1.0)  # Default weight for invalid samples
+
+    sample_weights = torch.DoubleTensor(sample_weights)
+    sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+
+    logger.info(f"Sample weight statistics:")
+    logger.info(f"  Min: {sample_weights.min():.4f}, Max: {sample_weights.max():.4f}")
+    logger.info(f"  Mean: {sample_weights.mean():.4f}, Std: {sample_weights.std():.4f}")
+    logger.info(f"Class sample counts: {dict(class_sample_counts)}")
+    logger.info("")
+
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=sampler,  # Use weighted sampler instead of shuffle
+        # shuffle=True,  # Incompatible with sampler
         num_workers=4,
         pin_memory=True,
         persistent_workers=True,
@@ -2363,7 +2449,12 @@ def main():
         count = class_counts.get(cls, 1)
         class_weights[i] = total / (count * num_classes)
 
-    logger.info(f"[info] Class weights: {class_weights}")
+    # Apply sqrt to prevent extreme weight ratios that can destabilize training
+    # This helps minority classes without overwhelming the loss
+    class_weights = torch.sqrt(class_weights)
+
+    logger.info(f"[info] Class counts: {dict(class_counts)}")
+    logger.info(f"[info] Class weights (after sqrt): {class_weights}")
 
     # Optimizer and scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -2379,7 +2470,9 @@ def main():
                 return step / warmup_steps
             else:
                 progress = (step - warmup_steps) / (total_steps - warmup_steps)
-                return args.min_lr / args.lr + (1 - args.min_lr / args.lr) * 0.5 * (1 + np.cos(np.pi * progress))
+                # Flatter cosine schedule: stays at high LR longer (power > 1 = slower decay)
+                cosine_decay = 0.5 * (1 + np.cos(np.pi * (progress ** 1.5)))
+                return args.min_lr / args.lr + (1 - args.min_lr / args.lr) * cosine_decay
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         plateau_scheduler = None
@@ -2443,6 +2536,30 @@ def main():
             for cls, f1 in zip(train_dataset.merged_classes, val_metrics['class_f1s']):
                 logger.info(f"  {cls}: {f1:.4f}")
 
+        # Minority class analysis (classes with <15% of data)
+        minority_threshold = 0.15
+        minority_f1s = []
+        minority_classes = []
+        logger.info("\nMinority class analysis (freq <15%):")
+        for idx, (cls, f1) in enumerate(zip(train_dataset.merged_classes, val_metrics['class_f1s'])):
+            class_count = class_counts.get(cls, 1)
+            class_freq = class_count / sum(class_counts.values())
+            if class_freq < minority_threshold:
+                minority_f1s.append(f1)
+                minority_classes.append(cls)
+                thr = val_metrics['best_thresholds'][idx] if idx < len(val_metrics['best_thresholds']) else 0.5
+                logger.info(f"  {cls} (freq={class_freq:.2%}): F1={f1:.4f}, thr={thr:.3f}")
+
+        if minority_f1s:
+            min_minority_f1 = min(minority_f1s)
+            avg_minority_f1 = np.mean(minority_f1s)
+            logger.info(f"  Minority avg F1: {avg_minority_f1:.4f}")
+            logger.info(f"  Minority min F1: {min_minority_f1:.4f}")
+        else:
+            min_minority_f1 = 1.0
+            avg_minority_f1 = 1.0
+            logger.info("  No minority classes found")
+
         # Keypoint metrics (only for multitask model)
         if args.model_type == 'multitask':
             logger.info("")
@@ -2482,9 +2599,22 @@ def main():
 
             wandb.log(wandb_log)
 
-        # Save best model
+        # Save best model (with minority-aware criterion)
+        improved = False
+
         if val_metrics['macro_f1'] > best_val_f1:
             best_val_f1 = val_metrics['macro_f1']
+            improved = True
+
+        # Also track best minority F1
+        if 'best_minority_f1' not in locals():
+            best_minority_f1 = 0.0
+
+        if minority_f1s and avg_minority_f1 > best_minority_f1:
+            best_minority_f1 = avg_minority_f1
+            improved = True
+
+        if improved:
             epochs_without_improvement = 0
 
             checkpoint = {
@@ -2492,6 +2622,7 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_val_f1': best_val_f1,
+                'best_minority_f1': best_minority_f1 if minority_f1s else 0.0,
                 'classes': train_dataset.merged_classes,
                 'orig_classes': train_dataset.orig_classes,
                 'col_map': train_dataset.col_map,
@@ -2513,11 +2644,20 @@ def main():
         else:
             epochs_without_improvement += 1
 
-        # Early stopping check
+        # Early stopping check (minority-aware)
         if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
-            logger.info(f"\n[info] Early stopping triggered after {epoch + 1} epochs")
-            logger.info(f"[info] No improvement for {epochs_without_improvement} epochs")
-            break
+            # Check if minority classes meet minimum F1 requirement
+            if minority_f1s and min_minority_f1 < args.min_minority_f1:
+                logger.info(f"\n[info] Early stopping patience reached, but minority F1 too low")
+                logger.info(f"[info] Min minority F1: {min_minority_f1:.3f} < required {args.min_minority_f1:.3f}")
+                logger.info(f"[info] Continuing training to improve minority classes...")
+                epochs_without_improvement = 0  # Reset counter
+            else:
+                logger.info(f"\n[info] Early stopping triggered after {epoch + 1} epochs")
+                logger.info(f"[info] No improvement for {epochs_without_improvement} epochs")
+                if minority_f1s:
+                    logger.info(f"[info] Min minority F1: {min_minority_f1:.3f} >= required {args.min_minority_f1:.3f}")
+                break
 
         # Step scheduler
         if scheduler is not None:

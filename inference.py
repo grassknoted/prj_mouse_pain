@@ -33,6 +33,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for saving plots
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 try:
     import timm
@@ -349,6 +353,7 @@ class TemporalConvNet(nn.Module):
         super().__init__()
 
         self.blocks = nn.ModuleList()
+        self.projections = nn.ModuleList()  # For residual connections when dims don't match
         dilations = [2 ** i for i in range(num_blocks)]  # [1, 2, 4]
 
         for i, dilation in enumerate(dilations):
@@ -360,14 +365,13 @@ class TemporalConvNet(nn.Module):
                 nn.GELU(),
                 nn.Dropout(dropout)
             )
-
             self.blocks.append(block)
 
-            # Residual projection if input dim doesn't match
-            if i == 0 and in_dim != hidden_dim:
-                self.input_proj = nn.Conv1d(in_dim, hidden_dim, kernel_size=1)
+            # Add projection if dimensions don't match
+            if in_dim != hidden_dim:
+                self.projections.append(nn.Conv1d(in_dim, hidden_dim, kernel_size=1))
             else:
-                self.input_proj = None
+                self.projections.append(None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -379,15 +383,15 @@ class TemporalConvNet(nn.Module):
         # Convert to (B, D, T) for Conv1d
         x = x.transpose(1, 2)  # (B, D, T)
 
-        residual = x
+        for i, (block, projection) in enumerate(zip(self.blocks, self.projections)):
+            identity = x
 
-        for i, block in enumerate(self.blocks):
-            if i == 0 and self.input_proj is not None:
-                residual = self.input_proj(x)
+            # Apply projection to identity if needed
+            if projection is not None:
+                identity = projection(identity)
 
-            x = block(x)
-            x = x + residual  # Residual connection
-            residual = x
+            # Apply block and add residual
+            x = block(x) + identity
 
         # Convert back to (B, T, D)
         x = x.transpose(1, 2)  # (B, T, hidden_dim)
@@ -561,6 +565,183 @@ class ActionOnlyModel(nn.Module):
 
 
 # ============================================================================
+# GROUND TRUTH LOADING
+# ============================================================================
+
+def find_ground_truth_csv(video_path: Path, annotations_dir: Optional[Path]) -> Optional[Path]:
+    """
+    Find ground truth annotation CSV for a video.
+
+    Args:
+        video_path: Path to video file
+        annotations_dir: Directory containing annotation CSVs
+
+    Returns:
+        Path to annotation CSV or None if not found
+    """
+    if annotations_dir is None:
+        return None
+
+    video_stem = video_path.stem
+
+    # Try multiple naming patterns
+    patterns = [
+        f"prediction_{video_stem}_*.csv",  # prediction_videoname_trial.csv
+        f"{video_stem}.csv",                # videoname.csv
+        f"*{video_stem}*.csv"               # any CSV containing video name
+    ]
+
+    for pattern in patterns:
+        matches = list(annotations_dir.glob(pattern))
+        # Filter out DLC files and prediction output files
+        matches = [m for m in matches if 'DLC' not in m.name and 'predictions' not in m.parent.name]
+        if matches:
+            return matches[0]
+
+    return None
+
+
+def load_ground_truth_labels(csv_path: Path, num_frames: int, class_names: List[str]) -> Optional[np.ndarray]:
+    """
+    Load ground truth action labels from CSV.
+
+    Args:
+        csv_path: Path to annotation CSV
+        num_frames: Expected number of frames
+        class_names: List of class names
+
+    Returns:
+        Array of action indices (num_frames,) or None if failed
+    """
+    try:
+        df = pd.read_csv(csv_path)
+
+        # Check if 'Action' column exists
+        if 'Action' not in df.columns:
+            logger.warning(f"No 'Action' column in {csv_path}")
+            return None
+
+        actions = df['Action'].values
+
+        # Ensure correct length (pad or truncate)
+        if len(actions) < num_frames:
+            # Pad with last action
+            padding = np.full(num_frames - len(actions), actions[-1] if len(actions) > 0 else 0)
+            actions = np.concatenate([actions, padding])
+        elif len(actions) > num_frames:
+            # Truncate
+            actions = actions[:num_frames]
+
+        return actions.astype(int)
+
+    except Exception as e:
+        logger.warning(f"Failed to load ground truth from {csv_path}: {e}")
+        return None
+
+
+# ============================================================================
+# ETHOGRAM VISUALIZATION
+# ============================================================================
+
+def plot_ethogram(
+    gt_labels: Optional[np.ndarray],
+    pred_labels: np.ndarray,
+    class_names: List[str],
+    output_path: Path,
+    video_name: str
+):
+    """
+    Plot behavioral ethogram comparing ground truth and predictions.
+
+    Args:
+        gt_labels: Ground truth action indices (num_frames,) or None
+        pred_labels: Predicted action indices (num_frames,)
+        class_names: List of class names
+        output_path: Path to save plot
+        video_name: Name of video for title
+    """
+    num_frames = len(pred_labels)
+
+    # Define colors for each behavior class (RGB normalized to 0-1)
+    colors_rgb = [
+        [0.12, 0.47, 0.71],  # rest - blue
+        [1.00, 0.50, 0.05],  # paw_withdraw - orange
+        [0.17, 0.63, 0.17],  # paw_lick - green
+        [0.84, 0.15, 0.16],  # paw_shake - red
+        [0.58, 0.40, 0.74],  # walk - purple
+        [0.55, 0.34, 0.29],  # active - brown
+    ]
+
+    # Ensure we have enough colors
+    while len(colors_rgb) < len(class_names):
+        colors_rgb.append([np.random.random(), np.random.random(), np.random.random()])
+
+    colors_rgb = np.array(colors_rgb)
+
+    # Create color image arrays (much faster than adding patches)
+    def labels_to_image(labels):
+        """Convert action labels to RGB image."""
+        img = np.zeros((1, num_frames, 3))
+        for i in range(num_frames):
+            action_idx = int(labels[i])
+            if 0 <= action_idx < len(class_names):
+                img[0, i, :] = colors_rgb[action_idx]
+        return img
+
+    # Create figure with two subplots (or one if no GT)
+    num_plots = 2 if gt_labels is not None else 1
+    fig, axes = plt.subplots(num_plots, 1, figsize=(16, 2 * num_plots), sharex=True)
+
+    if num_plots == 1:
+        axes = [axes]  # Make it iterable
+
+    # Plot ground truth if available
+    if gt_labels is not None:
+        ax = axes[0]
+        ax.set_title(f'Ground Truth - {video_name}', fontsize=14, fontweight='bold')
+
+        # Use imshow for fast rendering
+        gt_img = labels_to_image(gt_labels)
+        ax.imshow(gt_img, aspect='auto', extent=[0, num_frames, 0, 1], interpolation='nearest')
+
+        ax.set_ylabel('Ground Truth', fontsize=12)
+        ax.set_yticks([])
+
+        # Calculate accuracy
+        accuracy = np.mean(gt_labels == pred_labels) * 100
+        ax.text(0.02, 0.95, f'Accuracy: {accuracy:.1f}%',
+                transform=ax.transAxes, fontsize=11, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    # Plot predictions
+    pred_ax = axes[1] if gt_labels is not None else axes[0]
+    pred_ax.set_title(f'Predictions - {video_name}', fontsize=14, fontweight='bold')
+
+    # Use imshow for fast rendering
+    pred_img = labels_to_image(pred_labels)
+    pred_ax.imshow(pred_img, aspect='auto', extent=[0, num_frames, 0, 1], interpolation='nearest')
+
+    pred_ax.set_ylabel('Predictions', fontsize=12)
+    pred_ax.set_yticks([])
+    pred_ax.set_xlabel('Frame Number', fontsize=12)
+
+    # Add legend
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=colors_rgb[i], label=class_names[i])
+                       for i in range(min(len(class_names), len(colors_rgb)))]
+
+    pred_ax.legend(handles=legend_elements, loc='upper right', ncol=len(class_names),
+                   framealpha=0.9, fontsize=10)
+
+    # Tight layout and save
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"Saved ethogram to: {output_path}")
+
+
+# ============================================================================
 # INFERENCE
 # ============================================================================
 
@@ -647,10 +828,12 @@ def process_video(
     kp_names: List[str],
     img_size: int,
     likelihood_thr: float,
-    device: torch.device
+    device: torch.device,
+    annotations_dir: Optional[Path] = None,
+    plot_ethogram_flag: bool = False
 ):
     """
-    Process a single video: load, run inference, save predictions.
+    Process a single video: load, run inference, save predictions, and optionally plot ethogram.
 
     Args:
         video_path: Path to video file
@@ -662,6 +845,8 @@ def process_video(
         img_size: Image size for model input
         likelihood_thr: Likelihood threshold for DLC keypoints
         device: Torch device
+        annotations_dir: Directory containing ground truth annotations (optional)
+        plot_ethogram_flag: Whether to generate ethogram plots
     """
     logger.info(f"\nProcessing: {video_path.name}")
 
@@ -715,6 +900,27 @@ def process_video(
         output_filename = f"{video_path.stem}_predictions.csv"
         output_path = output_dir / output_filename
         save_predictions(output_path, probs, class_names)
+
+        # Generate ethogram if requested
+        if plot_ethogram_flag:
+            logger.info("  Generating ethogram...")
+
+            # Get predicted labels
+            pred_labels = np.argmax(probs, axis=1)
+
+            # Try to load ground truth
+            gt_labels = None
+            if annotations_dir is not None:
+                gt_csv_path = find_ground_truth_csv(video_path, annotations_dir)
+                if gt_csv_path is not None:
+                    logger.info(f"  Found ground truth: {gt_csv_path.name}")
+                    gt_labels = load_ground_truth_labels(gt_csv_path, num_frames, class_names)
+                else:
+                    logger.info("  No ground truth found, plotting predictions only")
+
+            # Plot ethogram
+            ethogram_path = output_dir / f"{video_path.stem}_ethogram.png"
+            plot_ethogram(gt_labels, pred_labels, class_names, ethogram_path, video_path.name)
 
         logger.info(f"  [success] Processed {video_path.name}")
 
@@ -773,6 +979,19 @@ Output:
         help='Device to use for inference (default: auto-detect)'
     )
 
+    parser.add_argument(
+        '--ethogram',
+        action='store_true',
+        help='Generate ethogram plots comparing ground truth and predictions'
+    )
+
+    parser.add_argument(
+        '--annotations_dir',
+        type=str,
+        default=None,
+        help='Path to folder containing ground truth annotation CSVs (required for ethogram with ground truth)'
+    )
+
     args = parser.parse_args()
 
     # Setup device
@@ -791,16 +1010,30 @@ Output:
         sys.exit(1)
 
     logger.info(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Extract metadata from checkpoint
     train_args = checkpoint['args']
     class_names = checkpoint['classes']
     num_classes = len(class_names)
-    kp_names = checkpoint['kp_names'].split(',')
+
+    # Handle kp_names - can be either string or list depending on how checkpoint was saved
+    kp_names_raw = checkpoint['kp_names']
+    if isinstance(kp_names_raw, str):
+        kp_names = kp_names_raw.split(',')
+    else:
+        kp_names = kp_names_raw  # Already a list
 
     logger.info(f"Model trained with {num_classes} classes: {class_names}")
     logger.info(f"Keypoints: {kp_names}")
+
+    # Detect which backbone was used during training
+    state_dict_keys = checkpoint['model_state_dict'].keys()
+    uses_3d_backbone = any('backbone_3d' in key for key in state_dict_keys)
+    uses_2d_backbone = any('backbone_2d' in key for key in state_dict_keys)
+
+    logger.info(f"Checkpoint uses 3D backbone: {uses_3d_backbone}")
+    logger.info(f"Checkpoint uses 2D backbone: {uses_2d_backbone}")
 
     # Initialize model
     logger.info("Initializing model...")
@@ -813,10 +1046,30 @@ Output:
         head_dropout=train_args.get('head_dropout', 0.2)
     ).to(device)
 
+    # Verify backbone compatibility
+    if uses_3d_backbone and not model.is_3d:
+        logger.error("Checkpoint was trained with VideoMAE (3D) but VideoMAE is not available!")
+        logger.error("Install transformers: pip install transformers")
+        sys.exit(1)
+
+    if uses_2d_backbone and model.is_3d:
+        logger.warning("Checkpoint was trained with 2D backbone but 3D backbone initialized")
+        logger.warning("This shouldn't happen - reinitializing with 2D backbone")
+        # Force 2D backbone by removing 3D
+        model.is_3d = False
+
     # Load model weights
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    logger.info("Model loaded successfully")
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        logger.info("Model loaded successfully")
+    except RuntimeError as e:
+        logger.error("Failed to load model weights!")
+        logger.error(f"Error: {e}")
+        logger.error("\nTroubleshooting:")
+        logger.error("1. Ensure the checkpoint matches the model architecture")
+        logger.error("2. Check if you need to install transformers for VideoMAE support")
+        sys.exit(1)
 
     # Initialize PoseGraph
     pose_graph = PoseGraph()
@@ -830,6 +1083,17 @@ Output:
     output_folder = input_folder.parent / f"predictions_{input_folder.name}"
     output_folder.mkdir(exist_ok=True)
     logger.info(f"Output folder: {output_folder}")
+
+    # Setup annotations directory for ethogram
+    annotations_dir = None
+    if args.annotations_dir is not None:
+        annotations_dir = Path(args.annotations_dir)
+        if not annotations_dir.exists():
+            logger.warning(f"Annotations directory not found: {annotations_dir}")
+            logger.warning("Ethograms will be generated without ground truth")
+            annotations_dir = None
+        else:
+            logger.info(f"Annotations folder: {annotations_dir}")
 
     # Find all video files
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv']
@@ -861,7 +1125,9 @@ Output:
             kp_names=kp_names,
             img_size=train_args.get('img_size', 224),
             likelihood_thr=train_args.get('kp_likelihood_thr', 0.90),
-            device=device
+            device=device,
+            annotations_dir=annotations_dir,
+            plot_ethogram_flag=args.ethogram
         )
 
     logger.info("\n" + "="*80)
